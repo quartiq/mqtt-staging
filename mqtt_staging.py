@@ -65,9 +65,7 @@ class MqttClient:
         self._client = Client(f"mqtt-staging-{uuid.uuid4().hex}", clean_session=True)
         self._client.on_message = self._on_message
         self._client.on_subscribe = self._on_subscribe
-        self._client.on_unsubscribe = self._on_unsubscribe
         self._subacks: dict[int, asyncio.Future[tuple[int, ...]]] = {}
-        self._unsubacks: dict[int, asyncio.Future[tuple[int, ...]]] = {}
 
     async def __aenter__(self) -> MqttClient:
         await self._client.connect(self.host, self.port, version=MQTTv50)
@@ -85,16 +83,6 @@ class MqttClient:
         reasons = await asyncio.wait_for(future, 3.0)
         if not reasons or reasons[0] >= 128:
             raise MQTTError(f"SUBACK failed for {topic}: {reasons}")
-
-    async def unsubscribe(self, topic: str) -> None:
-        mid = self._client.unsubscribe(topic)
-        if mid is None:
-            return
-        future = asyncio.get_running_loop().create_future()
-        self._unsubacks[mid] = future
-        reasons = await asyncio.wait_for(future, 3.0)
-        if reasons and reasons[0] >= 128:
-            raise MQTTError(f"UNSUBACK failed for {topic}: {reasons}")
 
     async def publish(
         self,
@@ -125,15 +113,6 @@ class MqttClient:
         _properties: MqttProperties,
     ) -> None:
         if future := self._subacks.pop(mid, None):
-            future.set_result(reasons)
-
-    def _on_unsubscribe(
-        self,
-        _client: Client,
-        mid: int,
-        reasons: tuple[int, ...],
-    ) -> None:
-        if future := self._unsubacks.pop(mid, None):
             future.set_result(reasons)
 
 
@@ -295,111 +274,107 @@ async def stage(
         messages = client.messages
         LOGGER.info("subscribing status topic %s", status_topic)
         await client.subscribe(status_topic, qos=QOS_AT_LEAST_ONCE)
-        try:
-            LOGGER.info("publishing manifest topic %s", manifest_topic)
-            await client.publish(
-                manifest_topic,
-                manifest,
-                qos=QOS_AT_LEAST_ONCE,
-                properties={"payload_format_id": 1},
+        LOGGER.info("publishing manifest topic %s", manifest_topic)
+        await client.publish(
+            manifest_topic,
+            manifest,
+            qos=QOS_AT_LEAST_ONCE,
+            properties={"payload_format_id": 1},
+        )
+        preparing = True
+        while True:
+            status = await wait_status(
+                messages,
+                status_topic,
+                transfer,
+                timeout=prepare_timeout if preparing else timeout,
             )
-            preparing = True
-            while True:
-                status = await wait_status(
-                    messages,
-                    status_topic,
-                    transfer,
-                    timeout=prepare_timeout if preparing else timeout,
-                )
-                LOGGER.debug(
-                    (
-                        "status state=%s code=%s offset=%s next=%s/%s "
-                        "mtu=%s write=%s response=%s correlation=%dB"
-                    ),
+            LOGGER.debug(
+                (
+                    "status state=%s code=%s offset=%s next=%s/%s "
+                    "mtu=%s write=%s response=%s correlation=%dB"
+                ),
+                status.state,
+                status.code,
+                status.offset,
+                status.next_offset,
+                status.size,
+                status.mtu,
+                status.write_size,
+                status.response_topic,
+                len(status.correlation_data or b""),
+            )
+            if status.code == "complete":
+                LOGGER.info("staging complete size=%s", status.size)
+                return
+            if (
+                status.response_topic != f"{prefix}/chunk"
+                or status.offset != status.next_offset
+            ):
+                raise RuntimeError(f"invalid staging chunk request: {status}")
+            if status.state == "preparing":
+                LOGGER.info(
+                    "status state=%s code=%s next=%s/%s",
                     status.state,
+                    status.code,
+                    status.next_offset,
+                    status.size,
+                )
+                continue
+            preparing = False
+            if should_log_chunk_progress(
+                offset=status.offset,
+                payload_len=max(status.next_offset - status.offset, 0),
+                size=status.size,
+                chunk_size=max(status.mtu, 1),
+            ):
+                LOGGER.info(
+                    "status code=%s offset=%s next=%s/%s mtu=%s write=%s",
                     status.code,
                     status.offset,
                     status.next_offset,
                     status.size,
                     status.mtu,
                     status.write_size,
-                    status.response_topic,
-                    len(status.correlation_data or b""),
                 )
-                if status.code == "complete":
-                    LOGGER.info("staging complete size=%s", status.size)
-                    return
-                if (
-                    status.response_topic != f"{prefix}/chunk"
-                    or status.offset != status.next_offset
-                ):
-                    raise RuntimeError(f"invalid staging chunk request: {status}")
-                if status.state == "preparing":
-                    LOGGER.info(
-                        "status state=%s code=%s next=%s/%s",
-                        status.state,
-                        status.code,
-                        status.next_offset,
-                        status.size,
-                    )
-                    continue
-                preparing = False
-                if should_log_chunk_progress(
-                    offset=status.offset,
-                    payload_len=max(status.next_offset - status.offset, 0),
-                    size=status.size,
-                    chunk_size=max(status.mtu, 1),
-                ):
-                    LOGGER.info(
-                        "status code=%s offset=%s next=%s/%s mtu=%s write=%s",
-                        status.code,
-                        status.offset,
-                        status.next_offset,
-                        status.size,
-                        status.mtu,
-                        status.write_size,
-                    )
-                size = aligned_chunk_size(chunk_size, status.mtu, status.write_size)
-                if size == 0:
-                    raise RuntimeError(
-                        "device MTU cannot fit one aligned write: "
-                        f"mtu={status.mtu} write_size={status.write_size}"
-                    )
-                offset = status.offset
-                chunk = data[offset : offset + size]
-                if not chunk:
-                    raise RuntimeError(f"device requested empty chunk at {offset}")
-                raw_len = len(chunk)
-                if offset + len(chunk) >= len(data):
-                    chunk += b"\xff" * ((-len(chunk)) % status.write_size)
-                if should_log_chunk_progress(
-                    offset=offset,
-                    payload_len=raw_len,
-                    size=len(data),
-                    chunk_size=max(size, 1),
-                ):
-                    LOGGER.info(
-                        "publishing chunk offset=%s raw=%sB payload=%sB",
-                        offset,
-                        raw_len,
-                        len(chunk),
-                    )
-                else:
-                    LOGGER.debug(
-                        "publishing chunk offset=%s raw=%sB payload=%sB",
-                        offset,
-                        raw_len,
-                        len(chunk),
-                    )
-                await client.publish(
-                    status.response_topic,
-                    chunk,
-                    qos=QOS_AT_LEAST_ONCE,
-                    properties=chunk_properties(status.correlation_data, offset),
+            size = aligned_chunk_size(chunk_size, status.mtu, status.write_size)
+            if size == 0:
+                raise RuntimeError(
+                    "device MTU cannot fit one aligned write: "
+                    f"mtu={status.mtu} write_size={status.write_size}"
                 )
-        finally:
-            LOGGER.info("unsubscribing status topic %s", status_topic)
-            await client.unsubscribe(status_topic)
+            offset = status.offset
+            chunk = data[offset : offset + size]
+            if not chunk:
+                raise RuntimeError(f"device requested empty chunk at {offset}")
+            raw_len = len(chunk)
+            if offset + len(chunk) >= len(data):
+                chunk += b"\xff" * ((-len(chunk)) % status.write_size)
+            if should_log_chunk_progress(
+                offset=offset,
+                payload_len=raw_len,
+                size=len(data),
+                chunk_size=max(size, 1),
+            ):
+                LOGGER.info(
+                    "publishing chunk offset=%s raw=%sB payload=%sB",
+                    offset,
+                    raw_len,
+                    len(chunk),
+                )
+            else:
+                LOGGER.debug(
+                    "publishing chunk offset=%s raw=%sB payload=%sB",
+                    offset,
+                    raw_len,
+                    len(chunk),
+                )
+            await client.publish(
+                status.response_topic,
+                chunk,
+                qos=QOS_AT_LEAST_ONCE,
+                properties=chunk_properties(status.correlation_data, offset),
+            )
 
 
 async def async_main() -> None:

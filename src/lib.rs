@@ -1045,6 +1045,21 @@ mod tests {
     }
 
     #[test]
+    fn largest_status_fits_the_fixed_buffer() {
+        let status = Status {
+            state: State::Preparing,
+            code: StatusCode::Unaligned,
+            id: "012345678901234567890123456789012345678901234567",
+            next_offset: u32::MAX,
+            size: u32::MAX,
+            mtu: usize::MAX,
+            write_size: usize::MAX,
+        };
+        let mut payload = [0; MAX_STATUS_BYTES];
+        assert!(serde_json_core::ser::to_slice(&status, &mut payload).is_ok());
+    }
+
+    #[test]
     fn abort_marks_ready_transfer_failed() {
         let mut service = ready_service();
         assert!(service.abort());
