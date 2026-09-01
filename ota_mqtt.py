@@ -34,6 +34,27 @@ class Message:
     properties: MqttProperties
 
 
+@dataclass(frozen=True, slots=True)
+class Transfer:
+    """Identity of the manifest being served."""
+
+    id: str
+    resource_id: bytes
+    size: int
+
+    @classmethod
+    def from_manifest(cls, manifest: bytes) -> Transfer:
+        data = json.loads(manifest)
+        return cls(str(data["sequence"]), data["resource"].encode(), data["size"])
+
+    def matches(self, status: Status) -> bool:
+        return (
+            status.id == self.id
+            and status.correlation_data == self.resource_id
+            and status.size == self.size
+        )
+
+
 class MqttClient:
     """gmqtt adapter for the OTA sender."""
 
@@ -123,6 +144,7 @@ class Status:
 
     state: str
     code: str
+    id: str
     response_topic: str
     correlation_data: bytes
     offset: int
@@ -139,6 +161,7 @@ class Status:
         return cls(
             state=data["state"],
             code=data["code"],
+            id=data["id"],
             response_topic=_first(properties, "response_topic"),
             correlation_data=_first(properties, "correlation_data"),
             offset=int(user_properties["offset"]),
@@ -152,6 +175,7 @@ class Status:
         if self.state == "error" or self.code in {
             "backend",
             "error",
+            "mtu",
             "offset",
             "oversize",
             "unaligned",
@@ -226,6 +250,7 @@ def broker_endpoint(broker: str) -> tuple[str, int]:
 async def wait_status(
     messages: asyncio.Queue[Message],
     topic: str,
+    transfer: Transfer,
     *,
     timeout: float,
 ) -> Status:
@@ -237,6 +262,12 @@ async def wait_status(
             if message.topic != topic:
                 continue
             status = Status.from_message(message)
+            if not status.id and not status.correlation_data:
+                status.raise_for_error()
+                continue
+            if not transfer.matches(status):
+                LOGGER.debug("ignoring status for another OTA transfer")
+                continue
             status.raise_for_error()
             return status
     raise TimeoutError(f"timed out waiting for {topic}")
@@ -263,6 +294,7 @@ async def send_update(
         len(image),
         chunk_size,
     )
+    transfer = Transfer.from_manifest(manifest)
     async with MqttClient(broker) as client:
         status_topic = f"{prefix}/status"
         trigger_topic = f"{prefix}/trigger"
@@ -282,6 +314,7 @@ async def send_update(
                 status = await wait_status(
                     messages,
                     status_topic,
+                    transfer,
                     timeout=prepare_timeout if preparing else timeout,
                 )
                 LOGGER.debug(
@@ -302,6 +335,11 @@ async def send_update(
                 if status.code == "complete":
                     LOGGER.info("OTA complete size=%s", status.size)
                     return
+                if (
+                    status.response_topic != f"{prefix}/chunk"
+                    or status.offset != status.next_offset
+                ):
+                    raise RuntimeError(f"invalid OTA chunk request: {status}")
                 if status.state == "preparing":
                     LOGGER.info(
                         "status state=%s code=%s next=%s/%s",

@@ -118,10 +118,14 @@ Status reports `state`, `code`, `id`, `next_offset`, `size`, `mtu`, and
 - `CorrelationData`: the trigger's resource identifier
 - `UserProperty("offset", decimal)`: requested byte offset
 
-The host mirrors the correlation data and offset in its QoS 1 chunk publish.
-Chunks are sequential. Duplicates are acknowledged without another flash
-write, future offsets are rejected, and final alignment padding must be
+The host accepts status only for its manifest identity, then mirrors the
+correlation data and offset in its QoS 1 chunk publish. Trigger delivery is
+idempotent. Chunks are sequential; duplicates are acknowledged without another
+flash write, future offsets are rejected, and final alignment padding must be
 `0xff`.
+
+An error during an active transfer is terminal. Rebuild the service only after
+the application has quiesced any outstanding flash work, or reboot it.
 
 `begin_startup()`, `handle()`, `status()`, `abort()`, and `complete_flash()`
 only update local state. `step()` performs at most one MQTT operation and is

@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 from ota_mqtt import (
     Status,
+    Transfer,
     aligned_chunk_size,
     broker_endpoint,
     chunk_properties,
     json_manifest,
+    wait_status,
 )
 
 
 class Message:
-    def __init__(self, payload: bytes, properties) -> None:
+    def __init__(
+        self,
+        payload: bytes,
+        properties,
+        topic: str = "devices/example/ota/status",
+    ) -> None:
+        self.topic = topic
         self.payload = payload
         self.properties = properties
 
@@ -51,6 +60,7 @@ class HostToolTests(unittest.TestCase):
 
         self.assertEqual(status.state, "receiving")
         self.assertEqual(status.code, "accepted")
+        self.assertEqual(status.id, "23")
         self.assertEqual(status.response_topic, "devices/example/ota/chunk")
         self.assertEqual(status.correlation_data, b"resource")
         self.assertEqual(status.offset, 1024)
@@ -64,6 +74,18 @@ class HostToolTests(unittest.TestCase):
             Message(
                 b'{"state":"error","code":"offset","id":"23",'
                 b'"next_offset":0,"size":2048,"mtu":1024,"write_size":32}',
+                status_properties(),
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "rejected"):
+            status.raise_for_error()
+
+    def test_status_raises_on_mtu_rejection(self) -> None:
+        status = Status.from_message(
+            Message(
+                b'{"state":"idle","code":"mtu","id":"",'
+                b'"next_offset":0,"size":0,"mtu":1024,"write_size":32}',
                 status_properties(),
             )
         )
@@ -86,6 +108,36 @@ class HostToolTests(unittest.TestCase):
             b'{"size":6,"resource":"devices/example/ota/85944171f73967e8",'
             b'"sequence":23,"digest":9625390261332436968}',
         )
+
+
+class HostToolAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wait_status_ignores_another_transfer(self) -> None:
+        messages = asyncio.Queue()
+        properties = status_properties()
+        await messages.put(
+            Message(
+                b'{"state":"receiving","code":"accepted","id":"22",'
+                b'"next_offset":0,"size":2048,"mtu":1024,"write_size":32}',
+                properties,
+            )
+        )
+        await messages.put(
+            Message(
+                b'{"state":"receiving","code":"accepted","id":"23",'
+                b'"next_offset":1024,"size":2048,"mtu":1024,"write_size":32}',
+                properties,
+            )
+        )
+
+        status = await wait_status(
+            messages,
+            "devices/example/ota/status",
+            Transfer("23", b"resource", 2048),
+            timeout=0.1,
+        )
+
+        self.assertEqual(status.id, "23")
+        self.assertEqual(status.next_offset, 1024)
 
 
 if __name__ == "__main__":

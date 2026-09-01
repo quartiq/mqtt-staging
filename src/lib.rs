@@ -5,7 +5,7 @@ use defmt::{debug, info, trace, warn};
 use heapless::{String, Vec};
 use minimq::{
     ConnectEvent, Connection, Error as MqttError, InboundPublish, Io, Op, Properties, Property,
-    PubError, Publication, QoS, ResourceError, SubscriptionOptions, TopicFilter,
+    PubError, Publication, QoS, ResourceError, RetainHandling, SubscriptionOptions, TopicFilter,
 };
 use serde::{Deserialize, Serialize};
 
@@ -265,6 +265,7 @@ impl Service {
         let replay = self.replay_status();
         match event {
             ConnectEvent::Connected => {
+                self.inflight = None;
                 self.startup_publish = replay;
                 self.queue(Action::Subscribe);
             }
@@ -324,7 +325,10 @@ impl Service {
     /// failed. A later `step()` or reconnect startup replay will publish
     /// `error` status for the same transfer.
     pub fn abort(&mut self) -> bool {
-        if self.state == State::Idle {
+        if !matches!(
+            self.state,
+            State::Preparing | State::Receiving | State::Writing
+        ) {
             return false;
         }
         warn!(
@@ -422,8 +426,6 @@ impl Service {
         }
         let Some(chunk) = chunk_properties(properties) else {
             warn!("Rejecting OTA chunk without required properties");
-            self.state = State::Error;
-            self.queue(Action::Publish(StatusCode::Error));
             return Handle::Consumed;
         };
         self.handle_chunk(chunk.resource_id, chunk.offset, payload)
@@ -464,10 +466,14 @@ impl Service {
         let Some(action) = self.pending.take() else {
             return Ok(Step::Quiescent);
         };
-        self.inflight = self
-            .start_action(connection, action)
-            .await?
-            .map(|op| InFlightAction { action, op });
+        let op = match self.start_action(connection, action).await {
+            Ok(op) => op,
+            Err(error) => {
+                self.pending = Some(action);
+                return Err(error);
+            }
+        };
+        self.inflight = op.map(|op| InFlightAction { action, op });
         Ok(if self.inflight.is_none() && self.pending.is_none() {
             Step::Quiescent
         } else {
@@ -476,20 +482,36 @@ impl Service {
     }
 
     fn handle_trigger<'a>(&mut self, payload: &'a [u8]) -> Handle<'a> {
+        let Ok(manifest) = parse_trigger(payload) else {
+            warn!("Rejecting OTA trigger: invalid manifest");
+            if self.state == State::Idle {
+                self.queue(Action::Publish(StatusCode::Error));
+            }
+            return Handle::Consumed;
+        };
+        let Ok(id) = manifest_id(manifest.sequence) else {
+            warn!("Rejecting OTA trigger: invalid sequence");
+            self.queue(Action::Publish(StatusCode::Error));
+            return Handle::Consumed;
+        };
         if self.state != State::Idle {
+            if self.update.as_ref().is_some_and(|update| {
+                update.id == id
+                    && update.size == manifest.size
+                    && update.resource_id == manifest.resource_id
+                    && update.fnv1a64 == manifest.fnv1a64
+            }) {
+                debug!("Replaying status for duplicate OTA trigger");
+                self.queue(Action::Publish(self.current_code()));
+                return Handle::Consumed;
+            }
             warn!(
                 "Rejecting overlapping OTA trigger state={:?} offset={=u32}",
                 self.state,
                 self.status().next_offset
             );
-            self.queue(Action::Publish(StatusCode::Error));
             return Handle::Consumed;
         }
-        let Ok(manifest) = parse_trigger(payload) else {
-            warn!("Rejecting OTA trigger: invalid manifest");
-            self.queue(Action::Publish(StatusCode::Error));
-            return Handle::Consumed;
-        };
         if manifest.size == 0 {
             warn!("Rejecting OTA trigger: zero-length image");
             self.queue(Action::Publish(StatusCode::Error));
@@ -516,11 +538,6 @@ impl Service {
             self.queue(Action::Publish(StatusCode::Mtu));
             return Handle::Consumed;
         }
-        let Ok(id) = manifest_id(manifest.sequence) else {
-            warn!("Rejecting OTA trigger: invalid sequence");
-            self.queue(Action::Publish(StatusCode::Error));
-            return Handle::Consumed;
-        };
         self.update = Some(Update {
             id,
             resource_id: manifest.resource_id,
@@ -551,19 +568,26 @@ impl Service {
             debug!("Ignoring OTA chunk while prepare is still pending");
             return Handle::Consumed;
         }
+        if matches!(self.state, State::Complete | State::Error) {
+            self.queue(Action::Publish(self.current_code()));
+            return Handle::Consumed;
+        }
         let Some(update) = self.update.as_mut() else {
             debug!("Ignoring OTA chunk without active transfer");
             self.queue(Action::Publish(StatusCode::Idle));
             return Handle::Consumed;
         };
+        if resource_id != update.resource_id.as_slice() {
+            debug!("Ignoring OTA chunk for another transfer");
+            return Handle::Consumed;
+        }
         if self.state == State::Writing {
             let duplicate = matches!(
                 self.flash.as_ref(),
                 Some(FlashOp::Write {
                     offset: pending_offset,
                     ..
-                }) if resource_id == update.resource_id.as_slice()
-                    && offset == *pending_offset
+                }) if offset == *pending_offset
             );
             if duplicate {
                 debug!(
@@ -589,7 +613,6 @@ impl Service {
         }
         let next_offset = match validate_chunk(
             update,
-            resource_id,
             offset,
             payload,
             self.capacity,
@@ -694,11 +717,13 @@ impl Service {
                     TopicFilter::new(trigger_topic.as_str()).options(
                         SubscriptionOptions::default()
                             .maximum_qos(QoS::AtLeastOnce)
+                            .retain_behavior(RetainHandling::Never)
                             .ignore_local_messages(),
                     ),
                     TopicFilter::new(chunk_topic.as_str()).options(
                         SubscriptionOptions::default()
                             .maximum_qos(QoS::AtLeastOnce)
+                            .retain_behavior(RetainHandling::Never)
                             .ignore_local_messages(),
                     ),
                 ];
@@ -811,12 +836,6 @@ fn log_chunk_queue_reject(code: StatusCode, expected_offset: u32, offset: u32, l
                 expected_offset, offset, len
             );
         }
-        StatusCode::Error => {
-            warn!(
-                "Rejecting OTA chunk with wrong resource id expected_offset={=u32} got={=u32}",
-                expected_offset, offset
-            );
-        }
         _ => {
             warn!(
                 "Rejecting OTA chunk expected={=u32} got={=u32} len={=usize} code={:?}",
@@ -828,16 +847,12 @@ fn log_chunk_queue_reject(code: StatusCode, expected_offset: u32, offset: u32, l
 
 fn validate_chunk(
     update: &Update,
-    resource_id: &[u8],
     offset: u32,
     payload: &[u8],
     capacity: u32,
     max_chunk_size: usize,
     write_size: usize,
 ) -> Result<u32, ChunkError> {
-    if resource_id != update.resource_id.as_slice() {
-        return Err(ChunkError::Queue(StatusCode::Error));
-    }
     if offset < update.next_offset {
         return Err(ChunkError::Queue(StatusCode::Duplicate));
     }
@@ -1136,6 +1151,14 @@ mod tests {
     }
 
     #[test]
+    fn abort_is_noop_after_transfer_completes() {
+        let mut service = service(128);
+        service.state = State::Complete;
+        assert!(!service.abort());
+        assert_eq!(service.status().state, State::Complete);
+    }
+
+    #[test]
     fn trigger_reports_preparing_before_flash_prepare_completes() {
         let mut service = service(128);
         let handle = trigger(&mut service, br#"{"size":8,"resource":"dt/sinara/mpll/ota/u1","sequence":23,"digest":9126140903112366317}"#);
@@ -1238,6 +1261,50 @@ mod tests {
         }
 
         #[test]
+        fn duplicate_final_chunk_replays_complete_status() {
+            let mut service = service(128);
+            let mut backend = Backend::default();
+            drive_trigger(&mut service, &mut backend, JSON_TRIGGER_8);
+            drive_chunk(&mut service, &mut backend, RESOURCE, "0", &[1, 2, 3, 4]);
+            drive_chunk(&mut service, &mut backend, RESOURCE, "4", &[5, 6, 7, 8]);
+            service.pending = None;
+
+            assert!(matches!(
+                chunk(&mut service, RESOURCE, "4", &[5, 6, 7, 8]),
+                Handle::Consumed
+            ));
+            assert_eq!(service.state, State::Complete);
+            assert_eq!(service.pending, Some(Action::Publish(StatusCode::Complete)));
+            assert_eq!(backend.writes.len(), 2);
+        }
+
+        #[test]
+        fn unrelated_chunks_do_not_disrupt_active_transfer() {
+            let mut service = service(128);
+            let mut backend = Backend::default();
+            drive_trigger(&mut service, &mut backend, JSON_TRIGGER_8);
+            service.pending = None;
+
+            assert!(matches!(
+                service.handle_publish_with_properties(
+                    service.chunk_topic().as_str(),
+                    &[1, 2, 3, 4],
+                    &Properties::from_slice(&[]),
+                ),
+                Handle::Consumed
+            ));
+            assert_eq!(service.state, State::Receiving);
+            assert_eq!(service.pending, None);
+
+            assert!(matches!(
+                chunk(&mut service, b"another-transfer", "0", &[1, 2, 3, 4]),
+                Handle::Consumed
+            ));
+            assert_eq!(service.state, State::Receiving);
+            assert_eq!(service.pending, None);
+        }
+
+        #[test]
         fn future_offset_is_rejected_without_write() {
             let mut service = service(128);
             let mut backend = Backend::default();
@@ -1252,10 +1319,11 @@ mod tests {
         }
 
         #[test]
-        fn overlapping_trigger_is_ignored_while_receiving() {
+        fn overlapping_trigger_does_not_disrupt_active_transfer() {
             let mut service = service(128);
             let mut backend = Backend::default();
             drive_trigger(&mut service, &mut backend, JSON_TRIGGER_8);
+            service.pending = None;
             assert!(matches!(
                 trigger(&mut service, JSON_TRIGGER_6),
                 Handle::Consumed
@@ -1263,10 +1331,26 @@ mod tests {
 
             assert_eq!(backend.prepared, Some(8));
             assert_eq!(service.state, State::Receiving);
-            assert_eq!(service.pending, Some(Action::Publish(StatusCode::Error)));
+            assert_eq!(service.pending, None);
             let update = service.update.unwrap();
             assert_eq!(update.size, 8);
             assert_eq!(update.next_offset, 0);
+        }
+
+        #[test]
+        fn duplicate_trigger_replays_active_status() {
+            let mut service = service(128);
+            let mut backend = Backend::default();
+            drive_trigger(&mut service, &mut backend, JSON_TRIGGER_8);
+            service.pending = None;
+
+            assert!(matches!(
+                trigger(&mut service, JSON_TRIGGER_8),
+                Handle::Consumed
+            ));
+            assert_eq!(service.state, State::Receiving);
+            assert_eq!(service.pending, Some(Action::Publish(StatusCode::Accepted)));
+            assert_eq!(backend.prepared, Some(8));
         }
 
         #[test]
