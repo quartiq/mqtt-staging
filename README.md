@@ -81,8 +81,9 @@ place.
 {"id":"85944171f73967e8","size":6,"fnv1a64":9625390261332436968}
 ```
 
-The device echoes `id` in status and as MQTT `CorrelationData`. Status also
-contains `state`, `code`, `next_offset`, `size`, `mtu`, and `write_size`, with:
+`id` is a 1–48 byte ASCII token using letters, digits, `-`, `_`, or `.`. The
+device echoes it in status and as MQTT `CorrelationData`. Status also contains
+`state`, `code`, `next_offset`, `size`, `mtu`, and `write_size`, with:
 
 - `ResponseTopic`: `<prefix>/chunk`
 - `UserProperty("offset", decimal)`: requested byte offset

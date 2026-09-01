@@ -807,7 +807,7 @@ fn validate_chunk(
 
 fn parse_manifest(payload: &[u8]) -> Result<Transfer, ()> {
     let (manifest, used) = serde_json_core::from_slice::<Manifest<'_>>(payload).map_err(|_| ())?;
-    if manifest.id.is_empty() || !payload[used..].iter().all(u8::is_ascii_whitespace) {
+    if !valid_id(manifest.id) || !payload[used..].iter().all(u8::is_ascii_whitespace) {
         return Err(());
     }
     Ok(Transfer {
@@ -816,6 +816,14 @@ fn parse_manifest(payload: &[u8]) -> Result<Transfer, ()> {
         next_offset: 0,
         fnv1a64: manifest.fnv1a64,
     })
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_TRANSFER_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._".contains(&byte))
 }
 
 struct ChunkProperties<'a> {
@@ -1123,6 +1131,7 @@ mod tests {
                 JSON_MANIFEST_MISSING_DIGEST,
                 JSON_MANIFEST_UNKNOWN_FIELD,
                 br#"{"id":"","size":8,"fnv1a64":9126140903112366317}"#,
+                br#"{"id":"bad/id","size":8,"fnv1a64":9126140903112366317}"#,
                 br#"{"id":"7ea690cc8c2cd8ed","size":8,"fnv1a64":9126140903112366317}x"#,
             ] {
                 let mut service = service(128);
