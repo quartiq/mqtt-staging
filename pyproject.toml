@@ -3,10 +3,10 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ota-mqtt"
+name = "mqtt-staging"
 # Note: keep this in sync with Cargo.toml
 version = "0.1.0"
-description = "MQTT firmware update host tool for embedded devices"
+description = "Stage bounded objects into embedded storage over MQTT"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT OR Apache-2.0"
@@ -23,13 +23,13 @@ classifiers = [
 dev = ["ruff>=0.11"]
 
 [project.urls]
-Repository = "https://github.com/quartiq/ota-mqtt"
+Repository = "https://github.com/quartiq/mqtt-staging"
 
 [project.scripts]
-ota-mqtt = "ota_mqtt:main"
+mqtt-staging = "mqtt_staging:main"
 
 [tool.setuptools]
-py-modules = ["ota_mqtt"]
+py-modules = ["mqtt_staging"]
 
 [tool.ruff]
 target-version = "py311"

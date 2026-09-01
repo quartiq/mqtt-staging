@@ -1,4 +1,4 @@
-"""Host-side MQTT OTA sender for devices using the ota-mqtt protocol."""
+"""Host-side sender for the mqtt-staging protocol."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ MqttProperties = dict[str, Any]
 
 @dataclass(frozen=True, slots=True)
 class Message:
-    """One MQTT PUBLISH received by the OTA sender."""
+    """One MQTT PUBLISH received by the staging command."""
 
     topic: str
     payload: bytes
@@ -39,31 +39,30 @@ class Transfer:
     """Identity of the manifest being served."""
 
     id: str
-    resource_id: bytes
     size: int
 
     @classmethod
     def from_manifest(cls, manifest: bytes) -> Transfer:
         data = json.loads(manifest)
-        return cls(str(data["sequence"]), data["resource"].encode(), data["size"])
+        return cls(data["id"], data["size"])
 
     def matches(self, status: Status) -> bool:
         return (
             status.id == self.id
-            and status.correlation_data == self.resource_id
+            and status.correlation_data == self.id.encode()
             and status.size == self.size
         )
 
 
 class MqttClient:
-    """gmqtt adapter for the OTA sender."""
+    """Small gmqtt adapter used by the staging command."""
 
     def __init__(self, broker: str):
         host, port = broker_endpoint(broker)
         self.host = host
         self.port = port
         self.messages: asyncio.Queue[Message] = asyncio.Queue()
-        self._client = Client(f"ota-mqtt-{uuid.uuid4().hex}", clean_session=True)
+        self._client = Client(f"mqtt-staging-{uuid.uuid4().hex}", clean_session=True)
         self._client.on_message = self._on_message
         self._client.on_subscribe = self._on_subscribe
         self._client.on_unsubscribe = self._on_unsubscribe
@@ -140,7 +139,7 @@ class MqttClient:
 
 @dataclass(frozen=True, slots=True)
 class Status:
-    """One device OTA status receipt."""
+    """One device staging status receipt."""
 
     state: str
     code: str
@@ -173,14 +172,14 @@ class Status:
 
     def raise_for_error(self) -> None:
         if self.state == "error" or self.code in {
-            "backend",
             "error",
             "mtu",
             "offset",
             "oversize",
+            "storage",
             "unaligned",
         }:
-            raise RuntimeError(f"device rejected OTA update: {self}")
+            raise RuntimeError(f"device rejected staging: {self}")
 
 
 def _first(properties: MqttProperties, name: str, default=None):
@@ -191,7 +190,7 @@ def _first(properties: MqttProperties, name: str, default=None):
 
 
 def aligned_chunk_size(requested: int, mtu: int, write_size: int) -> int:
-    """Choose a chunk size that the device can write directly to flash."""
+    """Choose a chunk size that meets the device write alignment."""
 
     size = min(requested, mtu)
     return size - size % write_size
@@ -206,11 +205,11 @@ def chunk_properties(correlation_data: bytes, offset: int) -> MqttProperties:
 
 
 def should_log_chunk_progress(
-    *, offset: int, payload_len: int, image_size: int, chunk_size: int
+    *, offset: int, payload_len: int, size: int, chunk_size: int
 ) -> bool:
     if offset == 0:
         return True
-    if offset + payload_len >= image_size:
+    if offset + payload_len >= size:
         return True
     if chunk_size <= 0:
         return False
@@ -225,17 +224,12 @@ def fnv1a64(data: bytes) -> int:
     return digest
 
 
-def json_manifest(
-    prefix: str,
-    image: bytes,
-    sequence: int,
-) -> bytes:
-    digest = fnv1a64(image)
+def json_manifest(data: bytes) -> bytes:
+    checksum = fnv1a64(data)
     manifest = {
-        "size": len(image),
-        "resource": f"{prefix}/{digest:016x}",
-        "sequence": sequence,
-        "digest": digest,
+        "id": f"{checksum:016x}",
+        "size": len(data),
+        "fnv1a64": checksum,
     }
     return json.dumps(manifest, separators=(",", ":")).encode()
 
@@ -266,45 +260,45 @@ async def wait_status(
                 status.raise_for_error()
                 continue
             if not transfer.matches(status):
-                LOGGER.debug("ignoring status for another OTA transfer")
+                LOGGER.debug("ignoring status for another staging transfer")
                 continue
             status.raise_for_error()
             return status
     raise TimeoutError(f"timed out waiting for {topic}")
 
 
-async def send_update(
+async def stage(
     *,
     broker: str,
     prefix: str,
     manifest: bytes,
-    image: bytes,
+    data: bytes,
     chunk_size: int,
     prepare_timeout: float,
     timeout: float,
 ) -> None:
-    """Publish one OTA manifest and serve requested image chunks."""
+    """Stage one object through a device's MQTT service."""
 
     host, port = broker_endpoint(broker)
     LOGGER.info(
-        "OTA broker=%s:%s prefix=%s image=%dB chunk=%dB",
+        "staging broker=%s:%s prefix=%s size=%dB chunk=%dB",
         host,
         port,
         prefix,
-        len(image),
+        len(data),
         chunk_size,
     )
     transfer = Transfer.from_manifest(manifest)
     async with MqttClient(broker) as client:
         status_topic = f"{prefix}/status"
-        trigger_topic = f"{prefix}/trigger"
+        manifest_topic = f"{prefix}/manifest"
         messages = client.messages
         LOGGER.info("subscribing status topic %s", status_topic)
         await client.subscribe(status_topic, qos=QOS_AT_LEAST_ONCE)
         try:
-            LOGGER.info("publishing trigger topic %s", trigger_topic)
+            LOGGER.info("publishing manifest topic %s", manifest_topic)
             await client.publish(
-                trigger_topic,
+                manifest_topic,
                 manifest,
                 qos=QOS_AT_LEAST_ONCE,
                 properties={"payload_format_id": 1},
@@ -333,13 +327,13 @@ async def send_update(
                     len(status.correlation_data or b""),
                 )
                 if status.code == "complete":
-                    LOGGER.info("OTA complete size=%s", status.size)
+                    LOGGER.info("staging complete size=%s", status.size)
                     return
                 if (
                     status.response_topic != f"{prefix}/chunk"
                     or status.offset != status.next_offset
                 ):
-                    raise RuntimeError(f"invalid OTA chunk request: {status}")
+                    raise RuntimeError(f"invalid staging chunk request: {status}")
                 if status.state == "preparing":
                     LOGGER.info(
                         "status state=%s code=%s next=%s/%s",
@@ -353,7 +347,7 @@ async def send_update(
                 if should_log_chunk_progress(
                     offset=status.offset,
                     payload_len=max(status.next_offset - status.offset, 0),
-                    image_size=status.size,
+                    size=status.size,
                     chunk_size=max(status.mtu, 1),
                 ):
                     LOGGER.info(
@@ -368,20 +362,20 @@ async def send_update(
                 size = aligned_chunk_size(chunk_size, status.mtu, status.write_size)
                 if size == 0:
                     raise RuntimeError(
-                        "device MTU cannot fit one aligned flash write: "
+                        "device MTU cannot fit one aligned write: "
                         f"mtu={status.mtu} write_size={status.write_size}"
                     )
                 offset = status.offset
-                chunk = image[offset : offset + size]
+                chunk = data[offset : offset + size]
                 if not chunk:
                     raise RuntimeError(f"device requested empty chunk at {offset}")
                 raw_len = len(chunk)
-                if offset + len(chunk) >= len(image):
+                if offset + len(chunk) >= len(data):
                     chunk += b"\xff" * ((-len(chunk)) % status.write_size)
                 if should_log_chunk_progress(
                     offset=offset,
                     payload_len=raw_len,
-                    image_size=len(image),
+                    size=len(data),
                     chunk_size=max(size, 1),
                 ):
                     LOGGER.info(
@@ -410,7 +404,7 @@ async def send_update(
 
 async def async_main() -> None:
     parser = argparse.ArgumentParser(
-        description=("Send an OTA manifest over MQTT and serve requested image chunks.")
+        description="Stage one object over MQTT.",
     )
     parser.add_argument("-v", "--verbose", action="count", default=0)
     parser.add_argument(
@@ -422,10 +416,9 @@ async def async_main() -> None:
         "-p",
         "--prefix",
         required=True,
-        help="complete protocol topic root, for example devices/example/ota",
+        help="complete protocol topic root, for example devices/example/staging",
     )
-    parser.add_argument("--image", type=Path, required=True)
-    parser.add_argument("--sequence", type=int, default=0)
+    parser.add_argument("--file", type=Path, required=True)
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--prepare-timeout", type=float, default=30.0)
     parser.add_argument("--timeout", type=float, default=10.0)
@@ -436,14 +429,14 @@ async def async_main() -> None:
         level=logging.INFO if args.verbose == 0 else logging.DEBUG,
     )
 
-    image = args.image.read_bytes()
-    manifest = json_manifest(args.prefix, image, args.sequence)
+    data = args.file.read_bytes()
+    manifest = json_manifest(data)
 
-    await send_update(
+    await stage(
         broker=args.broker,
         prefix=args.prefix,
         manifest=manifest,
-        image=image,
+        data=data,
         chunk_size=args.chunk_size,
         prepare_timeout=args.prepare_timeout,
         timeout=args.timeout,

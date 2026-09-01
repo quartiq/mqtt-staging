@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from ota_mqtt import (
+from mqtt_staging import (
     Status,
     Transfer,
     aligned_chunk_size,
@@ -13,13 +13,16 @@ from ota_mqtt import (
     wait_status,
 )
 
+PREFIX = "devices/example/staging"
+TRANSFER_ID = "85944171f73967e8"
+
 
 class Message:
     def __init__(
         self,
         payload: bytes,
         properties,
-        topic: str = "devices/example/ota/status",
+        topic: str = f"{PREFIX}/status",
     ) -> None:
         self.topic = topic
         self.payload = payload
@@ -28,8 +31,8 @@ class Message:
 
 def status_properties():
     return {
-        "response_topic": "devices/example/ota/chunk",
-        "correlation_data": b"resource",
+        "response_topic": f"{PREFIX}/chunk",
+        "correlation_data": TRANSFER_ID.encode(),
         "user_property": [("offset", "1024")],
     }
 
@@ -52,17 +55,17 @@ class HostToolTests(unittest.TestCase):
     def test_status_parses_receipt_payload(self) -> None:
         status = Status.from_message(
             Message(
-                b'{"state":"receiving","code":"accepted","id":"23",'
+                b'{"state":"ready","code":"accepted","id":"85944171f73967e8",'
                 b'"next_offset":1024,"size":2048,"mtu":1024,"write_size":32}',
                 status_properties(),
             )
         )
 
-        self.assertEqual(status.state, "receiving")
+        self.assertEqual(status.state, "ready")
         self.assertEqual(status.code, "accepted")
-        self.assertEqual(status.id, "23")
-        self.assertEqual(status.response_topic, "devices/example/ota/chunk")
-        self.assertEqual(status.correlation_data, b"resource")
+        self.assertEqual(status.id, TRANSFER_ID)
+        self.assertEqual(status.response_topic, f"{PREFIX}/chunk")
+        self.assertEqual(status.correlation_data, TRANSFER_ID.encode())
         self.assertEqual(status.offset, 1024)
         self.assertEqual(status.next_offset, 1024)
         self.assertEqual(status.size, 2048)
@@ -72,7 +75,7 @@ class HostToolTests(unittest.TestCase):
     def test_status_raises_on_rejection(self) -> None:
         status = Status.from_message(
             Message(
-                b'{"state":"error","code":"offset","id":"23",'
+                b'{"state":"error","code":"offset","id":"85944171f73967e8",'
                 b'"next_offset":0,"size":2048,"mtu":1024,"write_size":32}',
                 status_properties(),
             )
@@ -101,12 +104,11 @@ class HostToolTests(unittest.TestCase):
         self.assertEqual(properties["user_property"], [("offset", "37")])
 
     def test_json_manifest_is_compact_and_deterministic(self) -> None:
-        manifest = json_manifest("devices/example/ota", b"foobar", 23)
+        manifest = json_manifest(b"foobar")
 
         self.assertEqual(
             manifest,
-            b'{"size":6,"resource":"devices/example/ota/85944171f73967e8",'
-            b'"sequence":23,"digest":9625390261332436968}',
+            b'{"id":"85944171f73967e8","size":6,"fnv1a64":9625390261332436968}',
         )
 
 
@@ -116,14 +118,14 @@ class HostToolAsyncTests(unittest.IsolatedAsyncioTestCase):
         properties = status_properties()
         await messages.put(
             Message(
-                b'{"state":"receiving","code":"accepted","id":"22",'
+                b'{"state":"ready","code":"accepted","id":"other",'
                 b'"next_offset":0,"size":2048,"mtu":1024,"write_size":32}',
                 properties,
             )
         )
         await messages.put(
             Message(
-                b'{"state":"receiving","code":"accepted","id":"23",'
+                b'{"state":"ready","code":"accepted","id":"85944171f73967e8",'
                 b'"next_offset":1024,"size":2048,"mtu":1024,"write_size":32}',
                 properties,
             )
@@ -131,12 +133,12 @@ class HostToolAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         status = await wait_status(
             messages,
-            "devices/example/ota/status",
-            Transfer("23", b"resource", 2048),
+            f"{PREFIX}/status",
+            Transfer(TRANSFER_ID, 2048),
             timeout=0.1,
         )
 
-        self.assertEqual(status.id, "23")
+        self.assertEqual(status.id, TRANSFER_ID)
         self.assertEqual(status.next_offset, 1024)
 
 

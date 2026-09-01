@@ -1,135 +1,97 @@
-# ota-mqtt
+# mqtt-staging
 
-`ota-mqtt` stages firmware over MQTT 5. It provides a `no_std` Rust state
-machine for the device and a Python sender for the host. It does not own the
-network stack, flash task, allocation, timeouts, or reboot policy.
+`mqtt-staging` moves one bounded byte object into application-owned storage over
+MQTT 5. It provides a `no_std` Rust device state machine and one Python host
+command. The device requests sequential, write-aligned chunks, so an embedded
+application can stage directly into flash without buffering the whole object.
 
-The JSON trigger and FNV-1a digest detect transfer errors; they do not
-authenticate firmware. Signature and device-policy checks belong in the
-bootloader.
+Firmware is the prime use case (notably Stabilizer with Embassy flash), but OTA
+policy is deliberately outside the protocol. The application still owns MQTT
+I/O, storage, allocation, timeouts, checksum verification, activation, and
+reboot. FNV-1a detects staging errors; it does not authenticate firmware.
 
 ## Host
 
-With an MQTT broker running:
-
 ```console
 pipx install .
-ota-mqtt --prefix devices/example/ota --image firmware.bin
+mqtt-staging --prefix dt/sinara/stabilizer/ota --file firmware.bin
 ```
 
 `--broker` defaults to `$BROKER`, then `localhost:1883`. From a checkout,
-`uv run --project . ota-mqtt ...` or `python ota_mqtt.py ...` runs the same
-command.
-
-`--prefix` is the protocol root chosen by the application. The tool appends
-only `/trigger`, `/status`, and `/chunk`; `/ota` and `/dfu` are not imposed.
+`python mqtt_staging.py ...` runs the same command. The prefix is the exact root
+chosen by the application; the command appends only `/manifest`, `/status`, and
+`/chunk`.
 
 ## Device
 
 ```toml
 [dependencies]
-ota-mqtt = "0.1"
+mqtt-staging = "0.1"
 ```
 
-Create the service with the staging capacity, retained chunk capacity, and
-flash write alignment:
+Create a service with the staging capacity and direct-write limits:
 
 ```rust,ignore
-use embassy_futures::select::{Either, select};
-
-let mut ota = ota_mqtt::Service::new(
-    "devices/example/ota",
-    ota_mqtt::Config {
-        capacity: staging.capacity(),
-        max_chunk_size: flash.max_chunk_size(),
-        write_size: staging.write_size(),
+let mut staging = mqtt_staging::Service::new(
+    "dt/sinara/stabilizer/ota",
+    mqtt_staging::Config {
+        capacity: firmware.capacity(),
+        max_chunk_size: 4096,
+        write_size: firmware.write_size(),
     },
 )?;
-
-let mut connection = session.connect(io).await?;
-ota.begin_startup(connection.connect_event());
-
-loop {
-    let _ = ota.step(&mut connection).await?;
-
-    match select(connection.poll(), flash.wait_result()).await {
-        Either::First(publish) => {
-            if let Some(publish) = publish? {
-                match ota.handle(&publish) {
-                    ota_mqtt::Handle::Unhandled => handle_application_publish(publish),
-                    ota_mqtt::Handle::Consumed => {}
-                    ota_mqtt::Handle::Flash(request) => {
-                        // `flash` is application-owned. If it runs concurrently,
-                        // submit() copies the borrowed payload before returning.
-                        if !flash.submit(request) {
-                            ota.complete_flash(false);
-                        }
-                    }
-                }
-            }
-        }
-        Either::Second(success) => ota.complete_flash(success),
-    }
-
-    if ota.ready_to_reboot() {
-        apply_shutdown_and_reboot_policy();
-    }
-}
 ```
 
-Call `begin_startup()` after every connection. Keep calling `step()` to drain
-subscriptions and status publishes. Route every inbound publish through
-`handle()`, and report each emitted flash request once with
-`complete_flash()`.
+An Embassy flash worker can handle the emitted requests directly:
 
-`FlashWrite::payload` borrows Minimq's current RX packet and cannot survive
-another connection operation. A synchronous flash owner may consume it
-directly. A concurrent worker must copy it once into application-owned static
-or allocated storage. Its completion path must wake the owner independently of
-new broker traffic, as `flash.wait_result()` does above. Flash preparation,
-erasure, final verification, bootloader state, and reboot remain application
-responsibilities.
+```rust,ignore
+let ok = match request {
+    mqtt_staging::StagingRequest::Prepare { size } =>
+        firmware.prepare(size).await.is_ok(),
+    mqtt_staging::StagingRequest::Write(write) => {
+        let mut ok = firmware.write(write.offset, write.payload).await.is_ok();
+        if ok && let Some(expected) = write.fnv1a64 {
+            ok = firmware.finish(write.size, expected).await.is_ok();
+        }
+        ok
+    }
+};
+staging.complete_request(ok);
+```
+
+Here `firmware.write()` can be a thin call to Embassy
+`FirmwareUpdater::write_firmware()`. `finish()` verifies the staged bytes; the
+application decides whether to call `mark_updated()` and reboot.
+
+Call `begin_startup()` after each MQTT connection, `step()` until it is
+quiescent, and route inbound publishes through `handle()`. `StagingWrite` borrows
+Minimq's current RX packet. A concurrent worker must copy that payload once
+before the next connection operation; a synchronous worker may consume it in
+place.
 
 ## Protocol
 
-For a prefix such as `devices/example/ota`:
-
-| Topic | Direction | Payload |
+| Topic | Publisher | Payload |
 | --- | --- | --- |
-| `<prefix>/trigger` | host to device | JSON trigger |
-| `<prefix>/status` | device to host | JSON status and request properties |
-| `<prefix>/chunk` | host to device | firmware bytes |
-
-The trigger is:
+| `<prefix>/manifest` | host | JSON manifest |
+| `<prefix>/status` | device | JSON state and next-chunk properties |
+| `<prefix>/chunk` | host | object bytes |
 
 ```json
-{
-  "size": 4096,
-  "resource": "devices/example/ota/85944171f73967e8",
-  "sequence": 23,
-  "digest": 9625390261332434920
-}
+{"id":"85944171f73967e8","size":6,"fnv1a64":9625390261332436968}
 ```
 
-Status reports `state`, `code`, `id`, `next_offset`, `size`, `mtu`, and
-`write_size`. Its MQTT properties request the next chunk:
+The device echoes `id` in status and as MQTT `CorrelationData`. Status also
+contains `state`, `code`, `next_offset`, `size`, `mtu`, and `write_size`, with:
 
 - `ResponseTopic`: `<prefix>/chunk`
-- `CorrelationData`: the trigger's resource identifier
 - `UserProperty("offset", decimal)`: requested byte offset
 
-The host accepts status only for its manifest identity, then mirrors the
-correlation data and offset in its QoS 1 chunk publish. Trigger delivery is
-idempotent. Chunks are sequential; duplicates are acknowledged without another
-flash write, future offsets are rejected, and final alignment padding must be
-`0xff`.
-
-An error during an active transfer is terminal. Rebuild the service only after
-the application has quiesced any outstanding flash work, or reboot it.
-
-`begin_startup()`, `handle()`, `status()`, `abort()`, and `complete_flash()`
-only update local state. `step()` performs at most one MQTT operation and is
-cancellation-safe when the underlying Minimq I/O is cancellation-safe.
+The state path is `idle -> preparing -> ready <-> writing -> complete`; an
+active transfer may instead end in `error`. QoS 1 manifest and chunk duplicates
+are idempotent. Chunks are stop-and-wait and sequential; future offsets fail,
+and final alignment padding must be `0xff`. A new transfer requires a new
+service instance after `complete` or `error`.
 
 ## Tests
 
@@ -139,8 +101,8 @@ cargo test --all-targets
 BROKER=localhost:1883 cargo test --test end_to_end -- --ignored
 ```
 
-The broker integration runs the Python command through MQTT and Minimq into
-mock flash. Set `OTA_MQTT_FEEDER` to override the command.
+The ignored test crosses a real broker from the Python command through Minimq
+to mock storage. Set `MQTT_STAGING_FEEDER` to override the command.
 
 ## License
 

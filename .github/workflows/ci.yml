@@ -39,17 +39,17 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
       - run: cargo package
-      - run: python -m compileall -q ota_mqtt.py tests
+      - run: python -m compileall -q mqtt_staging.py tests
       - run: python -m unittest discover -s tests -p 'test_*.py'
-      - run: ruff format --check ota_mqtt.py tests/test_host.py
-      - run: ruff check ota_mqtt.py tests/test_host.py
+      - run: ruff format --check mqtt_staging.py tests/test_host.py
+      - run: ruff check mqtt_staging.py tests/test_host.py
       - run: python -m pip wheel --no-deps --wheel-dir dist .
       - name: Start MQTT broker
-        run: docker run --detach --rm --network host --name ota-mqtt-broker eclipse-mosquitto:2 mosquitto -p 1883
+        run: docker run --detach --rm --network host --name mqtt-staging-broker eclipse-mosquitto:2 mosquitto -p 1883
       - run: cargo test --test end_to_end -- --ignored
       - name: Stop MQTT broker
         if: always()
-        run: docker stop ota-mqtt-broker
+        run: docker stop mqtt-staging-broker
 
   msrv:
     runs-on: ubuntu-latest

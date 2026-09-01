@@ -1,13 +1,13 @@
 [package]
-name = "ota-mqtt"
+name = "mqtt-staging"
 version = "0.1.0"
 authors = ["Robert Jördens <rj@quartiq.de>"]
 edition = "2024"
-description = "MQTT firmware update service for embedded devices"
-repository = "https://github.com/quartiq/ota-mqtt"
+description = "Stage bounded objects into embedded storage over MQTT"
+repository = "https://github.com/quartiq/mqtt-staging"
 readme = "README.md"
 categories = ["embedded", "no-std", "network-programming"]
-keywords = ["mqtt", "ota", "embedded", "firmware"]
+keywords = ["mqtt", "embedded", "no-std", "staging"]
 license = "MIT OR Apache-2.0"
 rust-version = "1.93"
 
